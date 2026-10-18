@@ -1,34 +1,8 @@
-// Serves game.data and the engine wasm builds out of split parts on jsDelivr.
-//
-// The repository cannot hold the 6.79 GB data file as one file, so it is stored
-// as 341 parts of 19 MiB. This shim puts it back together at the HTTP level:
-//
-//   * filesystem.js only reads game.data through `Range: bytes=a-b` requests and
-//     requires 206, so a range is mapped onto just the parts that overlap it --
-//     a 6.79 GB Blob is never built
-//   * the emscripten glue fetches its .wasm whole, so those (2-3 parts each) are
-//     concatenated once and returned as application/wasm, which streaming
-//     compile requires
-//   * parts are cached in memory, because the filesystem reads 256 KB blocks and
-//     would otherwise refetch a 19 MiB part for every block inside it
-//
-// The fetch hook is installed synchronously and only *awaits* the manifest
-// inside each call: filesystem.js starts reading game.data as soon as the page's
-// scripts run, well before an async install() could resolve.
-//
-// In single-file mode `fileOrigin` also redirects the page's own-origin requests
-// (scripts, images, fmodstudio.wasm) to the CDN, since a lone HTML file has
-// nothing beside it.
 (function () {
-  const CACHE_BYTES = 256 * 1024 * 1024;
   const RETRY_DELAYS = [0, 500, 1500, 5000, 30000, 65000];
 
-  // Installed inside the filesystem worker, whose scope has `self` but no
-  // `window`. It only needs to serve ranged reads of game.data, so it carries a
-  // single manifest entry rather than the whole manifest.
   function WORKER_SHIM(entry, cdnBase) {
     const original = self.fetch.bind(self);
-    const cache = new Map();
     const offsets = [];
     let at = 0;
     for (let index = 0; index < entry.parts.length; index++) {
@@ -37,29 +11,38 @@
     }
     const total = at;
 
-    async function part(name) {
-      if (cache.has(name)) return cache.get(name);
+    async function fetchRange(partName, from, to) {
+      const url = `${cdnBase}/${partName}`;
+      const want = to - from + 1;
       for (let attempt = 0; attempt < 6; attempt++) {
         if (attempt > 0) {
           await new Promise((resolve) =>
             setTimeout(resolve, RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)]));
         }
+        let response = null;
         try {
-          const response = await original(`${cdnBase}/${name}`,
-            { cache: attempt === 0 ? 'force-cache' : 'no-store' });
-          if (response.ok) {
-            const bytes = new Uint8Array(await response.arrayBuffer());
-            cache.set(name, bytes);
-            return bytes;
-          }
-          const retryable = response.status === 403 || response.status === 404
-            || response.status === 429 || response.status >= 500;
-          if (!retryable) throw new Error(`HTTP ${response.status}`);
+          response = await original(url, {
+            headers: { Range: `bytes=${from}-${to}` },
+            cache: attempt === 0 ? 'force-cache' : 'no-store',
+          });
         } catch (error) {
-          // retry on the next pass
+          continue;
         }
+        if (response.status === 206) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          if (bytes.length === want) return bytes;
+          continue;
+        }
+        if (response.ok) {
+          const whole = new Uint8Array(await response.arrayBuffer());
+          if (whole.length >= to + 1) return whole.subarray(from, to + 1);
+          continue;
+        }
+        const retryable = response.status === 403 || response.status === 404
+          || response.status === 429 || response.status >= 500;
+        if (!retryable) throw new Error(`HTTP ${response.status}`);
       }
-      throw new Error(`part failed: ${name}`);
+      throw new Error(`part range failed: ${partName} ${from}-${to}`);
     }
 
     async function slice(start, end) {
@@ -70,11 +53,11 @@
         const partSize = (entry.sizes && entry.sizes[index]) || entry.partSize || 0;
         const partEnd = partStart + partSize - 1;
         if (partEnd < start || partStart > end) continue;
-        const bytes = await part(entry.parts[index]);
         const from = Math.max(start, partStart) - partStart;
         const to = Math.min(end, partEnd) - partStart;
-        out.set(bytes.subarray(from, to + 1), filled);
-        filled += to - from + 1;
+        const bytes = await fetchRange(entry.parts[index], from, to);
+        out.set(bytes, filled);
+        filled += bytes.length;
       }
       return out;
     }
@@ -121,9 +104,6 @@
     cdnBase: '',
     fileOrigin: '',
     ready: null,
-    parts: new Map(),
-    bytesHeld: 0,
-    blobs: new Map(),
     originalFetch: null,
     stats: { partFetches: 0, ranges: 0, bytesServed: 0 },
 
@@ -131,7 +111,7 @@
       this.cdnBase = String(cdnBase).replace(/\/+$/, '');
       this.fileOrigin = String(fileOrigin).replace(/\/+$/, '');
       this.originalFetch = globalThis.fetch.bind(globalThis);
-      // Start loading first, hook second, so the hook can be synchronous.
+
       this.ready = this._load(manifestUrl);
       this._patch();
       this._patchObjectUrls();
@@ -145,7 +125,6 @@
       return this.manifest;
     },
 
-    // --- manifest lookup ----------------------------------------------------
     _entryFor(url) {
       if (!this.manifest) return null;
       const raw = String(url).split(/[?#]/)[0];
@@ -153,62 +132,13 @@
       try {
         abs = new URL(raw, location.href).href;
       } catch (error) {
-        // keep the raw string
+
       }
       if (this.cdnBase && abs.includes(this.cdnBase)) return null;
       const base = abs.split('/').pop();
       return Object.prototype.hasOwnProperty.call(this.manifest, base) ? base : null;
     },
 
-    // --- part fetching ------------------------------------------------------
-    async _fetchPart(name, attempts = 6) {
-      const url = `${this.cdnBase}/${name}`;
-      let last = null;
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        if (attempt > 0) {
-          const wait = RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)];
-          await new Promise((resolve) => setTimeout(resolve, wait));
-        }
-        let response = null;
-        try {
-          // The first attempt may come from the HTTP cache; a retry must bypass
-          // it, because jsDelivr answers 403 while it fills its cache and that
-          // 403 is itself cacheable.
-          response = await this.originalFetch(url, {
-            cache: attempt === 0 ? 'force-cache' : 'no-store',
-          });
-        } catch (error) {
-          last = new Error(`network error (${error.message})`);
-          continue;
-        }
-        if (response.ok) return new Uint8Array(await response.arrayBuffer());
-        last = new Error(`HTTP ${response.status}`);
-        const retryable = response.status === 403 || response.status === 404
-          || response.status === 429 || response.status >= 500;
-        if (!retryable) throw last;
-      }
-      throw last || new Error('unknown failure');
-    },
-
-    _remember(name, bytes) {
-      this.parts.set(name, bytes);
-      this.bytesHeld += bytes.length;
-      for (const key of this.parts.keys()) {
-        if (this.bytesHeld <= CACHE_BYTES || key === name) break;
-        this.bytesHeld -= this.parts.get(key).length;
-        this.parts.delete(key);
-      }
-      return bytes;
-    },
-
-    async _part(name) {
-      const held = this.parts.get(name);
-      if (held) return held;
-      this.stats.partFetches++;
-      return this._remember(name, await this._fetchPart(name));
-    },
-
-    // --- range to parts -----------------------------------------------------
     _offsets(entry) {
       if (!entry.offsets) {
         let at = 0;
@@ -227,21 +157,80 @@
       return entry.totalSize;
     },
 
-    _rangeOf(init) {
-      const headers = (init && init.headers) || null;
-      if (!headers) return null;
-      let value = null;
-      if (typeof headers.get === 'function') {
-        value = headers.get('range');
-      } else {
-        for (const key of Object.keys(headers)) {
-          if (key.toLowerCase() === 'range') value = headers[key];
+    async _fetchRange(partName, from, to, attempts = 6) {
+      const url = `${this.cdnBase}/${partName}`;
+      const want = to - from + 1;
+      let last = null;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)]));
         }
+        let response = null;
+        try {
+
+          response = await this.originalFetch(url, {
+            headers: { Range: `bytes=${from}-${to}` },
+            cache: attempt === 0 ? 'force-cache' : 'no-store',
+          });
+        } catch (error) {
+          last = new Error(`network error (${error.message})`);
+          continue;
+        }
+        if (response.status === 206) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          if (bytes.length === want) {
+            this.stats.partFetches++;
+            return bytes;
+          }
+          last = new Error(`short read ${bytes.length}/${want}`);
+          continue;
+        }
+        if (response.ok) {
+
+          const whole = new Uint8Array(await response.arrayBuffer());
+          if (whole.length >= to + 1) {
+            this.stats.partFetches++;
+            return whole.subarray(from, to + 1);
+          }
+          last = new Error('range ignored and part too short');
+          continue;
+        }
+        last = new Error(`HTTP ${response.status}`);
+        const retryable = response.status === 403 || response.status === 404
+          || response.status === 429 || response.status >= 500;
+        if (!retryable) throw last;
       }
-      if (!value) return null;
-      const match = /bytes=(\d*)-(\d*)/.exec(String(value));
-      if (!match) return null;
-      return { first: match[1], last: match[2] };
+      throw last || new Error('unknown failure');
+    },
+
+    async _fetchWholePart(partName, attempts = 6) {
+      const url = `${this.cdnBase}/${partName}`;
+      let last = null;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)]));
+        }
+        let response = null;
+        try {
+          response = await this.originalFetch(url, {
+            cache: attempt === 0 ? 'force-cache' : 'no-store',
+          });
+        } catch (error) {
+          last = new Error(`network error (${error.message})`);
+          continue;
+        }
+        if (response.ok) {
+          this.stats.partFetches++;
+          return new Uint8Array(await response.arrayBuffer());
+        }
+        last = new Error(`HTTP ${response.status}`);
+        const retryable = response.status === 403 || response.status === 404
+          || response.status === 429 || response.status >= 500;
+        if (!retryable) throw last;
+      }
+      throw last || new Error('unknown failure');
     },
 
     async _slice(entry, start, end) {
@@ -253,22 +242,21 @@
         const partSize = (entry.sizes && entry.sizes[index]) || entry.partSize || 0;
         const partEnd = partStart + partSize - 1;
         if (partEnd < start || partStart > end) continue;
-        const bytes = await this._part(entry.parts[index]);
         const from = Math.max(start, partStart) - partStart;
         const to = Math.min(end, partEnd) - partStart;
-        out.set(bytes.subarray(from, to + 1), filled);
-        filled += to - from + 1;
+        const bytes = await this._fetchRange(entry.parts[index], from, to);
+        out.set(bytes, filled);
+        filled += bytes.length;
       }
       return out;
     },
 
-    async _wholeBlob(name, entry) {
-      if (this.blobs.has(name)) return this.blobs.get(name);
+    async _wholeBlob(entry) {
+      if (entry.blob) return entry.blob;
       const pieces = [];
-      for (const part of entry.parts) pieces.push(await this._part(part));
-      const blob = new Blob(pieces, { type: entry.type || 'application/octet-stream' });
-      this.blobs.set(name, blob);
-      return blob;
+      for (const part of entry.parts) pieces.push(await this._fetchWholePart(part));
+      entry.blob = new Blob(pieces, { type: entry.type || 'application/octet-stream' });
+      return entry.blob;
     },
 
     async _respond(name, init) {
@@ -287,7 +275,7 @@
 
       const range = this._rangeOf(init);
       if (!range) {
-        const blob = await this._wholeBlob(name, entry);
+        const blob = await this._wholeBlob(entry);
         this.stats.bytesServed += blob.size;
         return new Response(blob, {
           status: 200,
@@ -322,7 +310,59 @@
       });
     },
 
-    // --- origin redirect / dispatch -----------------------------------------
+    _rangeOf(init) {
+      const headers = (init && init.headers) || null;
+      if (!headers) return null;
+      let value = null;
+      if (typeof headers.get === 'function') {
+        value = headers.get('range');
+      } else {
+        for (const key of Object.keys(headers)) {
+          if (key.toLowerCase() === 'range') value = headers[key];
+        }
+      }
+      if (!value) return null;
+      const match = /bytes=(\d*)-(\d*)/.exec(String(value));
+      if (!match) return null;
+      return { first: match[1], last: match[2] };
+    },
+
+    _patchObjectUrls() {
+      if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+      if (typeof XMLHttpRequest !== 'function') return;
+      const shim = this;
+      const original = URL.createObjectURL.bind(URL);
+
+      URL.createObjectURL = function (blob) {
+        try {
+          if (blob && blob.type === 'text/javascript') {
+            const inner = original(blob);
+            const request = new XMLHttpRequest();
+
+            request.open('GET', inner, false);
+            request.send(null);
+            URL.revokeObjectURL(inner);
+            const source = request.responseText || '';
+
+            const looksLikeDownloader = source.includes('fetch') && source.includes('postMessage');
+            if (looksLikeDownloader && shim.manifest && shim.manifest['game.data']) {
+
+              const absoluteBase = new URL(shim.cdnBase || '.', document.baseURI)
+                .href.replace(/\/+$/, '');
+              const prelude = `(${WORKER_SHIM.toString()})`
+                + `(${JSON.stringify(shim.manifest['game.data'])}, `
+                + `${JSON.stringify(absoluteBase)});`;
+              return original(new Blob([prelude, '\n', source],
+                { type: 'text/javascript' }));
+            }
+          }
+        } catch (error) {
+
+        }
+        return original(blob);
+      };
+    },
+
     _redirect(url) {
       const abs = new URL(url, location.href);
       const isFile = abs.protocol === 'file:';
@@ -337,49 +377,6 @@
       }
       path = path.replace(/^null\//, '');
       return `${this.fileOrigin}/${path}${abs.search}`;
-    },
-
-    // --- worker support -----------------------------------------------------
-    // filesystem.js downloads game.data inside a Web Worker built from an inline
-    // Blob, where a window.fetch patch does not reach. Wrap such blobs so the
-    // worker gets its own copy of the shim.
-    _patchObjectUrls() {
-      if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
-      if (typeof XMLHttpRequest !== 'function') return;
-      const shim = this;
-      const original = URL.createObjectURL.bind(URL);
-
-      URL.createObjectURL = function (blob) {
-        try {
-          if (blob && blob.type === 'text/javascript') {
-            const inner = original(blob);
-            const request = new XMLHttpRequest();
-            // Synchronous on purpose: new Worker(url) needs the rewritten blob
-            // back immediately, and the blob is a few KB of source.
-            request.open('GET', inner, false);
-            request.send(null);
-            URL.revokeObjectURL(inner);
-            const source = request.responseText || '';
-            // The filesystem worker receives its URL by postMessage, so it never
-            // mentions game.data in its own source. Identify it by pulling data
-            // over fetch and messaging the page instead.
-            const looksLikeDownloader = source.includes('fetch') && source.includes('postMessage');
-            if (looksLikeDownloader && shim.manifest && shim.manifest['game.data']) {
-              // A blob-URL worker resolves relative paths against its own blob:
-              // URL, so the part base has to be absolute here.
-              const absoluteBase = new URL(shim.cdnBase || '.', location.href).href.replace(/\/+$/, '');
-              const prelude = `(${WORKER_SHIM.toString()})`
-                + `(${JSON.stringify(shim.manifest['game.data'])}, `
-                + `${JSON.stringify(absoluteBase)});`;
-              return original(new Blob([prelude, '\n', source],
-                { type: 'text/javascript' }));
-            }
-          }
-        } catch (error) {
-          // hand back the original blob
-        }
-        return original(blob);
-      };
     },
 
     _patch() {
@@ -407,7 +404,7 @@
             const target = this._redirect(url);
             if (target) return await this.originalFetch(target, init);
           } catch (error) {
-            // fall through to the original request
+
           }
         }
 
